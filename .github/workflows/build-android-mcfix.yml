@@ -89,6 +89,25 @@ jobs:
             exit 1
           fi
 
+      # 把编好的 arm64-android 依赖树导出，供 Windows 本地构建复用。
+      # 这样本地永远不需要在 Windows 上跑 vcpkg 交叉编译 ffmpeg（那是整条链路最脆的一环）。
+      # hwcodec/build.rs 只要求 $VCPKG_ROOT/installed/arm64-android/{lib,include} 存在。
+      - name: Export vcpkg android libs for local build
+        shell: bash
+        run: |
+          ROOT="${VCPKG_ROOT}/installed/arm64-android"
+          test -d "$ROOT/lib"  || { echo "missing $ROOT/lib"; exit 1; }
+          test -d "$ROOT/include" || { echo "missing $ROOT/include"; exit 1; }
+          mkdir -p /tmp/vcpkg-export
+          tar -czf /tmp/vcpkg-export/vcpkg-arm64-android.tar.gz -C "$ROOT" lib include
+          ls -lh /tmp/vcpkg-export/
+
+      - name: Upload vcpkg android libs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vcpkg-arm64-android
+          path: /tmp/vcpkg-export/vcpkg-arm64-android.tar.gz
+
       - name: Restore bridge files
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
