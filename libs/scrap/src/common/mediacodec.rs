@@ -179,9 +179,20 @@ fn create_media_codec(name: &str, direction: MediaCodecDirection) -> Option<Medi
     let codec = MediaCodec::from_decoder_type(name)?;
     let media_format = MediaFormat::new();
     media_format.set_str("mime", name);
-    media_format.set_i32("width", 0);
-    media_format.set_i32("height", 0);
+    // FIXME: 上游这里把 width/height 都设成 0，实测在高通 C2（c2.qti.hevc.decoder）上
+    // configure 直接返回 AMEDIA_ERROR_UNKNOWN，日志为：
+    //   Failed to init decoder: ErrorResult(ErrorUnknown)
+    // 也就是说"让码流决定尺寸"这条路在 C2 上并不成立，必须给一个具体尺寸。
+    // 这里先用 1920x1080（当前被控端 PC 的屏幕尺寸），configure 成功后解码器会按
+    // 码流里真实的 SPS 输出，dequeue_output_buffer 里读到的 width/height 才是权威值。
+    // TODO: 需要长期支持任意分辨率（例如虚拟屏 2200x1440）时，应改为在首帧到达后
+    // 解析 SPS 拿真实宽高再 configure，而不是依赖这里的固定值。
+    media_format.set_i32("width", 1920);
+    media_format.set_i32("height", 1080);
     media_format.set_i32("color-format", 19); // COLOR_FormatYUV420Planar
+    // NOTE: 部分 C2 解码器要求显式给出输入缓冲上限，缺失时 configure 或
+    // queueInputBuffer 会失败。2MB 对 1080p/1440p 的单帧绰绰有余。
+    media_format.set_i32("max-input-size", 2 * 1024 * 1024);
     if let Err(e) = codec.configure(&media_format, None, direction) {
         log::error!("Failed to init decoder: {:?}", e);
         return None;
