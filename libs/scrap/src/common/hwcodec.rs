@@ -362,6 +362,37 @@ impl HwRamDecoder {
         match Decoder::new(ctx) {
             Ok(decoder) => Ok(HwRamDecoder { decoder, info }),
             Err(_) => {
+                // FIXME: 硬解不可用时必须回退到 ffmpeg 软解，否则 valid 会变成 false，
+                // 远端直接黑屏（codec.rs 只在 !valid 时打一行 error，没有二级回退）。
+                // 仅对 Android 启用回退，避免改变 Windows/Linux 既有的 hwcodec 探测语义。
+                #[cfg(target_os = "android")]
+                {
+                    if info.hwdevice != hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE {
+                        log::warn!(
+                            "hardware decoder {:?} unavailable, fallback to software decoder",
+                            info.name
+                        );
+                        let soft = CodecInfo::soft();
+                        let soft_info = match format {
+                            CodecFormat::H264 => soft.h264,
+                            CodecFormat::H265 => soft.h265,
+                            _ => None,
+                        };
+                        if let Some(soft_info) = soft_info {
+                            let soft_ctx = DecodeContext {
+                                name: soft_info.name.clone(),
+                                device_type: hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE,
+                                thread_count: codec_thread_num(16) as _,
+                            };
+                            if let Ok(decoder) = Decoder::new(soft_ctx) {
+                                return Ok(HwRamDecoder {
+                                    decoder,
+                                    info: soft_info,
+                                });
+                            }
+                        }
+                    }
+                }
                 HwCodecConfig::clear(false, false);
                 Err(anyhow!(format!("Failed to create decoder")))
             }
@@ -597,8 +628,28 @@ impl HwCodecConfig {
                 });
             }
             log::debug!("e: {e:?}");
+            // TODO: 上游 1.5.3 的 Android 分支只注册了编码器（ram_encode），ram_decode 交给
+            // Default 变成空 Vec，导致 HwRamDecoder::try_get 只能拿 CodecInfo::soft() 软解兜底，
+            // 进而让 codec.rs 里 `if !valid && enable_hwcodec_option()` 的 MediaCodecDecoder
+            // 分支永远进不去 —— 官方 APK 在 Android 上从未走过硬件解码。
+            // 这里改为注册 FFmpeg 自带的 mediacodec 硬解封装，与 ram_encode 使用同一套 FFmpeg
+            // mediacodec 后端（该后端在 Android 构建中已启用，编码侧 hevc_mediacodec 正在工作）。
+            // 这样不需要依赖 MediaCodec 枚举（Kotlin 侧 setCodecInfo 目前会丢弃所有解码器），
+            // 也不需要启用 scrap 那个尚未完成的 mediacodec feature。
+            let d: Vec<CodecInfo> = ts
+                .iter()
+                .map(|t| CodecInfo {
+                    name: format!("{}_mediacodec", t.name_prefix),
+                    mc_name: None,
+                    format: t.data_format,
+                    hwdevice: hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_MEDIACODEC,
+                    priority: 0,
+                })
+                .collect();
+            log::debug!("d: {d:?}");
             HwCodecConfig {
                 ram_encode: e,
+                ram_decode: d,
                 ..Default::default()
             }
         }
