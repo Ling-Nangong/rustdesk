@@ -78,6 +78,17 @@ impl MediaCodecDecoder {
                 let h = res_format.i32("height").ok_or(Error::msg(
                     "Failed to dequeue_output_buffer, height is None",
                 ))? as usize;
+                // NOTE: 下面按 I420（COLOR_FormatYUV420Planar = 19）解析输出缓冲。
+                // 部分设备即使请求了 19 也会返回 NV12(21)/Flexible，那样画面会绿屏/花屏。
+                // 这里打一行日志，便于直接从 rs_rCURRENT.log 判断，不必再白编译一轮。
+                if let Some(cf) = res_format.i32("color-format") {
+                    if cf != 19 {
+                        log::warn!(
+                            "mediacodec output color-format={} (expected 19 planar), image may be broken",
+                            cf
+                        );
+                    }
+                }
                 let stride = res_format.i32("stride").ok_or(Error::msg(
                     "Failed to dequeue_output_buffer, stride is None",
                 ))?;
@@ -146,7 +157,7 @@ fn create_media_codec(name: &str, direction: MediaCodecDirection) -> Option<Medi
         log::error!("Failed to init decoder: {:?}", e);
         return None;
     };
-    log::error!("decoder init success");
+    log::info!("decoder init success: {:?}", name);
     if let Err(e) = codec.start() {
         log::error!("Failed to start decoder: {:?}", e);
         return None;
@@ -160,12 +171,32 @@ fn create_media_codec(name: &str, direction: MediaCodecDirection) -> Option<Medi
 
 pub fn check_mediacodec() {
     std::thread::spawn(move || {
-        // check decoders
-        let decoders = MediaCodecDecoder::new_decoders();
-        H264_DECODER_SUPPORT.swap(decoders.h264.is_some(), Ordering::SeqCst);
-        H265_DECODER_SUPPORT.swap(decoders.h265.is_some(), Ordering::SeqCst);
-        decoders.h264.map(|d| d.stop());
-        decoders.h265.map(|d| d.stop());
-        // TODO encoders
+        // FIXME: 上游这里调用 `MediaCodecDecoder::new_decoders()`，但该方法在 1.5.3 源码里
+        // 根本没有定义（半成品），一旦启用 mediacodec feature 就直接编译失败。
+        // 这里改成"按 MIME 查解码器是否存在"来探测，不走 configure：
+        // 探测的语义是"这台机器有没有该格式的硬解器"，而 configure 的成败依赖宽高/码流参数，
+        // 属于运行期问题，不该让它把能力上报打成 false（那会让对端放弃 H264/H265）。
+        // 查的是 AMediaCodec_createDecoderByType，不依赖 Kotlin 侧的 codec 列表
+        // （setCodecInfo 目前会把所有 decoder 丢弃）。
+        H264_DECODER_SUPPORT.store(probe_decoder(CodecFormat::H264), Ordering::SeqCst);
+        H265_DECODER_SUPPORT.store(probe_decoder(CodecFormat::H265), Ordering::SeqCst);
+        log::info!(
+            "mediacodec support: h264={} h265={}",
+            H264_DECODER_SUPPORT.load(Ordering::SeqCst),
+            H265_DECODER_SUPPORT.load(Ordering::SeqCst)
+        );
     });
+}
+
+fn probe_decoder(format: CodecFormat) -> bool {
+    let mime = match format {
+        CodecFormat::H264 => H264_MIME_TYPE,
+        CodecFormat::H265 => H265_MIME_TYPE,
+        _ => return false,
+    };
+    // 只查"解码器存不存在"，不做 configure / start。
+    // MediaCodec 的 Drop 会 release 原生句柄，不会泄漏实例。
+    let exists = MediaCodec::from_decoder_type(mime).is_some();
+    log::info!("mediacodec probe {} -> {}", mime, exists);
+    exists
 }

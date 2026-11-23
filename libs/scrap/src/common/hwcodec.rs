@@ -349,11 +349,40 @@ impl HwRamDecoder {
     }
 
     pub fn new(format: CodecFormat) -> ResultType<Self> {
+        // TODO: Android + mediacodec 构建下，不能把 ffmpeg 软解当成"可用解码器"返回。
+        // 上游 1.5.3 的 try_get 总是用 CodecInfo::soft() 兜底，导致 codec.rs 里 valid 恒为 true，
+        // 于是 `if !valid && enable_hwcodec_option()` 的 MediaCodecDecoder 分支永远进不去 ——
+        // 这就是官方 APK 在 Android 上从来没有走过硬件解码的直接原因。
+        // 这里让 new 只接受真正的硬解，软解交给 new_soft 在 MediaCodec 也失败之后兜底。
+        #[cfg(all(target_os = "android", feature = "mediacodec"))]
+        let allow_soft = false;
+        #[cfg(not(all(target_os = "android", feature = "mediacodec")))]
+        let allow_soft = true;
+        Self::new_inner(format, allow_soft)
+    }
+
+    /// 允许 ffmpeg 软解的兜底构造。给 codec.rs 在 MediaCodec 硬解也失败后做最后一级回退用，
+    /// 保证任何情况下都不会因为 `valid == false` 导致远端黑屏。
+    #[allow(dead_code)]
+    pub fn new_soft(format: CodecFormat) -> ResultType<Self> {
+        Self::new_inner(format, true)
+    }
+
+    fn new_inner(format: CodecFormat, allow_soft: bool) -> ResultType<Self> {
         let info = HwRamDecoder::try_get(format);
         log::info!("try create {info:?} ram decoder");
         let Some(info) = info else {
             bail!("unsupported format: {:?}", format);
         };
+        if !allow_soft
+            && info.hwdevice == hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_NONE
+        {
+            log::info!(
+                "skip software decoder {:?} here, leave it to MediaCodec",
+                info.name
+            );
+            bail!("software decoder is not accepted in this path");
+        }
         let ctx = DecodeContext {
             name: info.name.clone(),
             device_type: info.hwdevice.clone(),
@@ -628,28 +657,20 @@ impl HwCodecConfig {
                 });
             }
             log::debug!("e: {e:?}");
-            // TODO: 上游 1.5.3 的 Android 分支只注册了编码器（ram_encode），ram_decode 交给
-            // Default 变成空 Vec，导致 HwRamDecoder::try_get 只能拿 CodecInfo::soft() 软解兜底，
-            // 进而让 codec.rs 里 `if !valid && enable_hwcodec_option()` 的 MediaCodecDecoder
-            // 分支永远进不去 —— 官方 APK 在 Android 上从未走过硬件解码。
-            // 这里改为注册 FFmpeg 自带的 mediacodec 硬解封装，与 ram_encode 使用同一套 FFmpeg
-            // mediacodec 后端（该后端在 Android 构建中已启用，编码侧 hevc_mediacodec 正在工作）。
-            // 这样不需要依赖 MediaCodec 枚举（Kotlin 侧 setCodecInfo 目前会丢弃所有解码器），
-            // 也不需要启用 scrap 那个尚未完成的 mediacodec feature。
-            let d: Vec<CodecInfo> = ts
-                .iter()
-                .map(|t| CodecInfo {
-                    name: format!("{}_mediacodec", t.name_prefix),
-                    mc_name: None,
-                    format: t.data_format,
-                    hwdevice: hwcodec::ffmpeg::AVHWDeviceType::AV_HWDEVICE_TYPE_MEDIACODEC,
-                    priority: 0,
-                })
-                .collect();
-            log::debug!("d: {d:?}");
+            // FIXME: 这里故意**不**往 ram_decode 里塞 FFmpeg 的 `*_mediacodec` 解码器。
+            // 实测结论（2026-11-23，BTK-W00，解码器 c2.qti.hevc.decoder）：
+            //   Both surface and native_window are NULL
+            //   Failed to configure codec c2.qti.hevc.decoder (status = -542398533)
+            //     with format {mime=video/hevc, width=0, height=0}
+            //   avcodec_open2 failed, ret = Generic error in an external library
+            // 原因是 FFmpeg 的 mediacodec 解码器是**输出到 Surface** 的硬解封装，而
+            // hwcodec 的 ffmpeg_ram 需要 CPU 可读的帧（frame->data[]），两者模型不匹配；
+            // 且 avcodec_open2 时还没拿到 SPS/PPS，宽高为 0，configure 必然失败。
+            // Android 的硬解改由 scrap 的 mediacodec feature（MediaCodecDecoder：直连 ndk
+            // MediaCodec，ByteBuffer 进出，不依赖 Surface）承担，见 codec.rs 的 mediacodec 分支。
+            let _ = &ts;
             HwCodecConfig {
                 ram_encode: e,
-                ram_decode: d,
                 ..Default::default()
             }
         }

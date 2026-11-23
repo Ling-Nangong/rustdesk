@@ -113,9 +113,9 @@ pub struct Decoder {
     #[cfg(feature = "vram")]
     h265_vram: Option<VRamDecoder>,
     #[cfg(feature = "mediacodec")]
-    h264_media_codec: MediaCodecDecoder,
+    h264_media_codec: Option<MediaCodecDecoder>,
     #[cfg(feature = "mediacodec")]
-    h265_media_codec: MediaCodecDecoder,
+    h265_media_codec: Option<MediaCodecDecoder>,
     format: CodecFormat,
     valid: bool,
     #[cfg(feature = "hwcodec")]
@@ -560,6 +560,16 @@ impl Decoder {
                     }
                     valid = h264_media_codec.is_some();
                 }
+                #[cfg(all(feature = "mediacodec", feature = "hwcodec"))]
+                if !valid {
+                    // FIXME: MediaCodec 也失败时必须回到 ffmpeg 软解，否则 valid 为 false，
+                    // 下游没有二级回退，远端直接黑屏。这是最后一道保险，正常不该走到。
+                    match HwRamDecoder::new_soft(format) {
+                        Ok(v) => h264_ram = Some(v),
+                        Err(e) => log::error!("create H264 soft fallback decoder failed: {}", e),
+                    }
+                    valid = h264_ram.is_some();
+                }
             }
             CodecFormat::H265 => {
                 #[cfg(feature = "vram")]
@@ -585,6 +595,15 @@ impl Decoder {
                         log::error!("create H265 media codec decoder failed");
                     }
                     valid = h265_media_codec.is_some();
+                }
+                #[cfg(all(feature = "mediacodec", feature = "hwcodec"))]
+                if !valid {
+                    // FIXME: 同 H264 分支，MediaCodec 失败后必须回落到软解，否则远端黑屏。
+                    match HwRamDecoder::new_soft(format) {
+                        Ok(v) => h265_ram = Some(v),
+                        Err(e) => log::error!("create H265 soft fallback decoder failed: {}", e),
+                    }
+                    valid = h265_ram.is_some();
                 }
             }
             CodecFormat::Unknown => {
@@ -658,7 +677,7 @@ impl Decoder {
                     bail!("av1 decoder not available");
                 }
             }
-            #[cfg(any(feature = "hwcodec", feature = "vram"))]
+            #[cfg(any(feature = "hwcodec", feature = "vram", feature = "mediacodec"))]
             video_frame::Union::H264s(h264s) => {
                 *chroma = Some(Chroma::I420);
                 #[cfg(feature = "vram")]
@@ -670,9 +689,17 @@ impl Decoder {
                 if let Some(decoder) = &mut self.h264_ram {
                     return Decoder::handle_hwram_video_frame(decoder, h264s, rgb, &mut self.i420);
                 }
+                // FIXME: 这里必须继续往下落到 MediaCodec，不能直接 Err。
+                // 上游把 mediacodec 写成了独立的第二个 `Union::H264s` 分支，同时启用
+                // hwcodec + mediacodec 时它属于 unreachable pattern，永远轮不到；
+                // 而 h264_ram 为 None 时本分支又会直接返回 Err —— 结果就是黑屏。
+                #[cfg(feature = "mediacodec")]
+                if let Some(decoder) = &mut self.h264_media_codec {
+                    return Decoder::handle_mediacodec_video_frame(decoder, h264s, rgb);
+                }
                 Err(anyhow!("don't support h264!"))
             }
-            #[cfg(any(feature = "hwcodec", feature = "vram"))]
+            #[cfg(any(feature = "hwcodec", feature = "vram", feature = "mediacodec"))]
             video_frame::Union::H265s(h265s) => {
                 *chroma = Some(Chroma::I420);
                 #[cfg(feature = "vram")]
@@ -684,25 +711,11 @@ impl Decoder {
                 if let Some(decoder) = &mut self.h265_ram {
                     return Decoder::handle_hwram_video_frame(decoder, h265s, rgb, &mut self.i420);
                 }
-                Err(anyhow!("don't support h265!"))
-            }
-            #[cfg(feature = "mediacodec")]
-            video_frame::Union::H264s(h264s) => {
-                *chroma = Some(Chroma::I420);
-                if let Some(decoder) = &mut self.h264_media_codec {
-                    Decoder::handle_mediacodec_video_frame(decoder, h264s, rgb)
-                } else {
-                    Err(anyhow!("don't support h264!"))
-                }
-            }
-            #[cfg(feature = "mediacodec")]
-            video_frame::Union::H265s(h265s) => {
-                *chroma = Some(Chroma::I420);
+                #[cfg(feature = "mediacodec")]
                 if let Some(decoder) = &mut self.h265_media_codec {
-                    Decoder::handle_mediacodec_video_frame(decoder, h265s, rgb)
-                } else {
-                    Err(anyhow!("don't support h265!"))
+                    return Decoder::handle_mediacodec_video_frame(decoder, h265s, rgb);
                 }
+                Err(anyhow!("don't support h265!"))
             }
             _ => Err(anyhow!("unsupported video frame type!")),
         }
