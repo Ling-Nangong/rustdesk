@@ -43,7 +43,8 @@ impl MediaCodecDecoder {
             CodecFormat::H264 => create_media_codec(H264_MIME_TYPE, MediaCodecDirection::Decoder),
             CodecFormat::H265 => create_media_codec(H265_MIME_TYPE, MediaCodecDirection::Decoder),
             _ => {
-                log::error!("Unsupported codec format: {}", format);
+                // NOTE: CodecFormat 没有实现 Display，这里必须用 {:?}，否则编译报 E0277。
+                log::error!("Unsupported codec format: {:?}", format);
                 None
             }
         }
@@ -51,8 +52,9 @@ impl MediaCodecDecoder {
 
     // rgb [in/out] fmt and stride must be set in ImageRgb
     pub fn decode(&mut self, data: &[u8], rgb: &mut ImageRgb) -> ResultType<bool> {
-        // take dst_stride into account please
-        let dst_stride = rgb.stride();
+        // NOTE: 上游这里有一行 `let dst_stride = rgb.stride();`，但 ImageRgb 并没有实现
+        // TraitPixelBuffer，也没有 stride() 方法（E0599），且该变量后续从未被使用，故移除。
+        // 目标 stride 在下面的 I420To* 调用里用 bytes_per_row 传入。
         match self.dequeue_input_buffer(Duration::from_millis(10))? {
             Some(mut input_buffer) => {
                 let mut buf = input_buffer.buffer_mut();
@@ -93,10 +95,35 @@ impl MediaCodecDecoder {
                     "Failed to dequeue_output_buffer, stride is None",
                 ))?;
                 let buf = output_buffer.buffer();
-                let bps = 4;
-                let u = buf.len() * 2 / 3;
-                let v = buf.len() * 5 / 6;
-                rgb.raw.resize(h * w * bps, 0);
+                // FIXME: 上游用 `buf.len() * 2 / 3` 和 `* 5 / 6` 推算 U/V 平面偏移，
+                // 这只有在 stride == width（buf 恰好是 w*h*1.5）时才成立。
+                // 实际解码器的 stride 通常按 16/32 对齐，宽 1920 时可能是 1920 也可能更大，
+                // 一旦不等，U/V 会整体错位，画面变成花屏/绿斑。
+                // 正确偏移由 stride 推算：Y 占 stride*h，之后每个色度平面占 (stride/2)*(h/2)。
+                let y_size = stride.max(0) as usize * h;
+                let uv_size = (stride.max(0) as usize / 2) * (h / 2);
+                let (u, v) = (y_size, y_size + uv_size);
+                if buf.len() < y_size + uv_size * 2 {
+                    log::error!(
+                        "mediacodec output buffer too small: len={} need={} (stride={} {}x{})",
+                        buf.len(),
+                        y_size + uv_size * 2,
+                        stride,
+                        w,
+                        h
+                    );
+                    self.release_output_buffer(output_buffer, false)?;
+                    return Ok(false);
+                }
+                // FIXME: 原来这里只 resize 了 rgb.raw，既没设 rgb.w/rgb.h，也没按对齐算行宽。
+                // 下游是拿 rgb.w/rgb.h 去建纹理的，不设就是 0x0，画面直接黑掉。
+                // 与 hwcodec.rs 的 HwRamDecoder::to_fmt 保持一致：
+                // 先写 w/h，再按 rgb.align() 向上取整得到 bytes_per_row，最后 resize。
+                rgb.w = w;
+                rgb.h = h;
+                let dst_align = rgb.align();
+                let bytes_per_row = (rgb.w * 4 + dst_align - 1) & !(dst_align - 1);
+                rgb.raw.resize(rgb.h * bytes_per_row, 0);
                 let y_ptr = buf.as_ptr();
                 let u_ptr = buf[u..].as_ptr();
                 let v_ptr = buf[v..].as_ptr();
@@ -111,12 +138,14 @@ impl MediaCodecDecoder {
                                 v_ptr,
                                 stride / 2,
                                 rgb.raw.as_mut_ptr(),
-                                (w * bps) as _,
+                                bytes_per_row as _,
                                 w as _,
                                 h as _,
                             );
                         }
-                        ImageFormat::ARGB => {
+                        // FIXME: 上游这里两个 arm 都写成了 ImageFormat::ARGB，第二个永远不会命中，
+                        // ABGR 格式会走到 `_ =>` 直接 bail。第二个改为 ABGR。
+                        ImageFormat::ABGR => {
                             I420ToABGR(
                                 y_ptr,
                                 stride,
@@ -125,7 +154,7 @@ impl MediaCodecDecoder {
                                 v_ptr,
                                 stride / 2,
                                 rgb.raw.as_mut_ptr(),
-                                (w * bps) as _,
+                                bytes_per_row as _,
                                 w as _,
                                 h as _,
                             );
