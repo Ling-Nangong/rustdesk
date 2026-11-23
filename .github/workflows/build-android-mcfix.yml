@@ -4,10 +4,12 @@
 name: build-android-mcfix
 
 on:
+  # NOTE: 已停用 push 自动触发（2026-11-23）。原因：一轮 25~28 分钟，且经常在
+  # 环境依赖上翻车（jcenter 停服、Maven TLS 被掐、vcpkg 缓存未命中等）。
+  # 本地交叉编译链路已打通（libsodium.a 自建 + 阿里云 Maven 镜像），改 Rust 后
+  # 本地增量编译 2~3 分钟即可出 .so，不必再等 CI。
+  # 保留 workflow_dispatch，仅在需要干净环境复核时才手动触发。
   workflow_dispatch:
-  push:
-    branches:
-      - "mc-fix"
 
 env:
   RUST_VERSION: "1.75"
